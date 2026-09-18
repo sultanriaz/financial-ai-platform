@@ -1,0 +1,21 @@
+{
+  "Processes": [
+    {
+      "Name": "uvicorn",
+      "Pid": 19068
+    },
+    {
+      "Name": "scraper",
+      "Pid": 22828
+    },
+    {
+      "Name": "consumer",
+      "Pid": 4952
+    },
+    {
+      "Name": "frontend",
+      "Pid": 7828
+    }
+  ],
+  "StartedAt": "2026-09-18T00:56:02.2297452+05:00"
+}

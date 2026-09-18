@@ -1,0 +1,84 @@
+# FIX #14: Replace deprecated @app.on_event("startup"/"shutdown") with lifespan context manager.
+# FIX #13: CORS origins now read from settings (configurable via CORS_ORIGINS env var).
+# FIX #15: broadcaster() retries with exponential back-off so a Kafka outage at boot
+#          does not silently kill the task — the original fire-and-forget had no retry.
+import asyncio, json, logging
+from contextlib import asynccontextmanager
+from aiokafka import AIOKafkaConsumer
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from api.routes import router
+from api.websocket import manager
+from common.config import settings
+from database.db import init_db
+
+logger = logging.getLogger("api")
+
+
+async def run_broadcaster() -> None:
+    """
+    Consume financial-news-results and push each payload to connected WS clients.
+    Reconnects automatically with capped exponential back-off so a temporary Kafka
+    hiccup does not permanently stop the feed without any log output.
+    """
+    backoff = 1
+    while True:
+        consumer = AIOKafkaConsumer(
+            "financial-news-results",
+            bootstrap_servers=settings.kafka_url,
+            group_id="dashboard-broadcaster",
+            auto_offset_reset="latest",
+            value_deserializer=lambda v: json.loads(v.decode()),
+        )
+        try:
+            await consumer.start()
+            logger.info("Broadcaster: connected to Kafka, streaming to %d client(s)", len(manager.connections))
+            backoff = 1                          # reset on successful connect
+            async for message in consumer:
+                await manager.broadcast(message.value)
+        except asyncio.CancelledError:
+            return                               # clean shutdown — do not retry
+        except Exception as exc:
+            logger.warning("Broadcaster error (%s); retry in %ss", exc, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        finally:
+            try:
+                await consumer.stop()
+            except Exception:
+                pass
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    task = asyncio.create_task(run_broadcaster())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(title="Financial AI Intelligence API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,   # read from env, not hardcoded
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router)
+
+
+@app.websocket("/ws/news-stream")
+async def news_stream(websocket: WebSocket) -> None:
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except (WebSocketDisconnect, Exception):
+        manager.disconnect(websocket)

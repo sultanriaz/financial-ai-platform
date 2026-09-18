@@ -1,0 +1,200 @@
+import { useEffect, useMemo, useState } from "react";
+
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+
+type Stats = {
+  now: string;
+  news_total: number;
+  analysis_total: number;
+  price_total: number;
+  news_1m: number;
+  news_5m: number;
+  news_1h: number;
+  sources: number;
+  tickers: number;
+  latest_news: string | null;
+  ws_clients: number;
+  histogram: { minute: string; count: number }[];
+};
+
+type Status = "ok" | "idle" | "stalled";
+
+type NodeSpec = {
+  key: string;
+  label: string;
+  status: Status;
+  value: string;
+  unit: string;
+  sub: string;
+};
+
+function fmtAgo(iso: string | null): string {
+  if (!iso) return "never";
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 5_000)    return "just now";
+  if (diff < 60_000)   return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  return `${Math.floor(diff / 3_600_000)}h ago`;
+}
+
+function ActivityHistogram({ data }: { data: { minute: string; count: number }[] }) {
+  // Build a dense 60-min array, filling missing minutes with zero
+  const buckets = useMemo(() => {
+    const now = new Date();
+    now.setSeconds(0, 0);
+    const byMinute = new Map(data.map((d) => [d.minute.slice(0, 16), d.count]));
+    const out: number[] = [];
+    for (let i = 59; i >= 0; i--) {
+      const t = new Date(now.getTime() - i * 60_000);
+      const key = t.toISOString().slice(0, 16);
+      out.push(byMinute.get(key) ?? 0);
+    }
+    return out;
+  }, [data]);
+
+  const max = Math.max(1, ...buckets);
+
+  return (
+    <div className="pipeline-histogram" aria-label="Article arrivals per minute">
+      <div className="ph-bars">
+        {buckets.map((c, i) => (
+          <div
+            key={i}
+            className={`ph-bar${c > 0 ? " ph-bar--active" : ""}`}
+            style={{ height: `${Math.max(2, (c / max) * 100)}%` }}
+            title={`${c} article${c === 1 ? "" : "s"}`}
+          />
+        ))}
+      </div>
+      <div className="ph-label">Arrivals / minute · last 60 min</div>
+    </div>
+  );
+}
+
+export default function PipelineGraph() {
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const r = await fetch(`${API_BASE}/pipeline-stats`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        if (!cancelled) { setStats(await r.json()); setFailed(false); }
+      } catch {
+        if (!cancelled) setFailed(true);
+      }
+    };
+    poll();
+    const id = setInterval(poll, 3_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  const nodes: NodeSpec[] = useMemo(() => {
+    if (!stats) {
+      return [
+        { key: "rss",   label: "RSS Feeds", status: "idle", value: "…", unit: "", sub: "4 sources" },
+        { key: "scrp",  label: "Scraper",   status: "idle", value: "…", unit: "", sub: "15s poll" },
+        { key: "kfk",   label: "Kafka Raw", status: "idle", value: "…", unit: "", sub: "topic" },
+        { key: "ai",    label: "AI Engine", status: "idle", value: "…", unit: "", sub: "FinBERT + Ollama" },
+        { key: "pg",    label: "Postgres",  status: "idle", value: "…", unit: "", sub: "store" },
+      ];
+    }
+
+    const recent = stats.news_1m > 0 || stats.news_5m > 0;
+    const flowing: Status = recent ? "ok" : "idle";
+    const stalled: Status = failed ? "stalled" : "ok";
+
+    const gap = stats.news_total - stats.analysis_total;
+    const aiStatus: Status = failed
+      ? "stalled"
+      : gap > 5 ? "idle" : "ok";
+
+    return [
+      {
+        key: "rss", label: "RSS Feeds",
+        status: stalled,
+        value: String(stats.sources), unit: "",
+        sub: stats.sources === 1 ? "source" : "sources",
+      },
+      {
+        key: "scrp", label: "Scraper",
+        status: flowing,
+        value: String(stats.news_1h), unit: "/hr",
+        sub: "15s poll",
+      },
+      {
+        key: "kfk", label: "Kafka Raw",
+        status: flowing,
+        value: String(stats.news_total), unit: "",
+        sub: `${stats.news_1m}/min`,
+      },
+      {
+        key: "ai", label: "AI Engine",
+        status: aiStatus,
+        value: String(stats.analysis_total), unit: "",
+        sub: gap > 0 ? `${gap} in queue` : "all scored",
+      },
+      {
+        key: "pg", label: "Postgres",
+        status: stalled,
+        value: `${stats.news_total}/${stats.analysis_total}`, unit: "",
+        sub: `${stats.price_total} prices`,
+      },
+    ];
+  }, [stats, failed]);
+
+  const headerRight = stats
+    ? `${stats.news_total} events · ${stats.tickers} tickers · ${stats.ws_clients} client${stats.ws_clients === 1 ? "" : "s"}`
+    : "connecting…";
+
+  return (
+    <div className="pipeline-panel">
+      <div className="panel-heading">
+        <span>Pipeline Orchestration</span>
+        <span className={`panel-meta ${stats ? "panel-meta--live" : ""}`}>
+          <span className="panel-meta-dot" aria-hidden="true" />
+          {headerRight}
+        </span>
+      </div>
+
+      <div className="pipeline-chain">
+        {nodes.map((n, i) => (
+          <div key={n.key} className="pipeline-chain-item">
+            <div className={`pipeline-node pipeline-node--${n.status}`}>
+              <div className="node-head">
+                <span className="node-label">{n.label}</span>
+                <span className={`node-status node-status--${n.status}`} aria-hidden="true" />
+              </div>
+              <div className="node-value">
+                {n.value}
+                {n.unit && <span className="node-unit">{n.unit}</span>}
+              </div>
+              <div className="node-sub">{n.sub}</div>
+            </div>
+
+            {i < nodes.length - 1 && (
+              <div className={`pipeline-connector pipeline-connector--${n.status}`} aria-hidden="true">
+                <svg viewBox="0 0 40 20" preserveAspectRatio="none">
+                  <line x1="0" y1="10" x2="34" y2="10" stroke="currentColor" strokeWidth="1.5" strokeDasharray="4 4" />
+                  <polygon points="34,5 40,10 34,15" fill="currentColor" />
+                </svg>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {stats && stats.histogram.length >= 0 && (
+        <ActivityHistogram data={stats.histogram} />
+      )}
+
+      {stats && (
+        <div className="pipeline-footer">
+          <span>Last article: {fmtAgo(stats.latest_news)}</span>
+        </div>
+      )}
+    </div>
+  );
+}
